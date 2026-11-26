@@ -105,10 +105,10 @@ jobs:
 
           TUNNEL_URL=""
 
-          # 1. Try localhost.run (zero rate limits, supports WebSockets)
+          # 1. Try localhost.run (match ONLY *.lhr.life, ignore admin.localhost.run banner link)
           nohup ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ServerAliveInterval=30 -T -R 80:127.0.0.1:6080 nokey@localhost.run </dev/null >/tmp/vnc/lhr.log 2>&1 &
           for i in $(seq 1 20); do
-            TUNNEL_URL=$(grep -Eo 'https://[a-zA-Z0-9.-]+\.(lhr\.life|localhost\.run)' /tmp/vnc/lhr.log | head -1 || true)
+            TUNNEL_URL=$(grep -Eo 'https://[a-zA-Z0-9-]+\.lhr\.life' /tmp/vnc/lhr.log | head -1 || true)
             if [ -n "$TUNNEL_URL" ]; then
               echo "Got localhost.run tunnel: $TUNNEL_URL"
               break
