@@ -21,20 +21,25 @@ jobs:
     timeout-minutes: 190
 
     steps:
-      - name: Prevent sleep, wake display, and inspect GUI state
+      - name: Prevent sleep, wake display, and stage Cerin DMG
+        env:
+          DMG_URL: ${{ inputs.dmg_url }}
         run: |
-          echo "Host: $(uname -a)"
           sw_vers
           sudo pmset -a displaysleep 0 sleep 0 disksleep 0 || true
           sudo caffeinate -d -i -m -s -u </dev/null >/dev/null 2>&1 &
           caffeinate -u -t 5 || true
-          echo "=== Displays ==="
-          system_profiler SPDisplaysDataType || true
-          echo "=== Users & GUI ==="
-          who || true
-          ps aux | grep -iE 'WindowServer|loginwindow|screensharing|ARDAgent' || true
 
-      - name: Enable macOS Screen Sharing (VNC)
+          mkdir -p "$HOME/Desktop"
+          DMG_NAME="$(basename "$DMG_URL")"
+          curl -fL --retry 3 "$DMG_URL" -o "$HOME/Desktop/$DMG_NAME"
+          ls -lh "$HOME/Desktop/$DMG_NAME"
+          open -a Finder "$HOME/Desktop" || true
+          sleep 2
+          screencapture -x /tmp/shot.png || true
+          ls -lh /tmp/shot.png || true
+
+      - name: Enable macOS Screen Sharing & Check Virtual Display
         env:
           VNC_PASS: ${{ secrets.MACOS_VNC_PASSWORD }}
         run: |
@@ -46,7 +51,6 @@ jobs:
           sudo "$KICK" -activate -configure -access -on -allowAccessFor -allUsers -privs -all -clientopts -setvnclegacy -vnclegacy yes -setvncpw -vncpw "$VNC_PASS" -restart -agent -console
           sudo launchctl kickstart -k system/com.apple.screensharing 2>/dev/null || sudo launchctl load -w /System/Library/LaunchDaemons/com.apple.screensharing.plist 2>/dev/null || true
 
-          echo "Waiting for VNC port 5900..."
           for i in $(seq 1 20); do
             if nc -z 127.0.0.1 5900; then
               echo "VNC listening on 127.0.0.1:5900"
@@ -56,39 +60,18 @@ jobs:
           done
           nc -z 127.0.0.1 5900 || { echo "ERROR: VNC port 5900 did not come up."; exit 1; }
 
-          open -a Finder "$HOME/Desktop" || true
-          sleep 2
-          screencapture -x /tmp/shot.png 2>&1 || true
-          ls -lh /tmp/shot.png || true
-          python3 - <<'PY'
-          import os, zlib, struct
-          p = "/tmp/shot.png"
-          if not os.path.exists(p):
-              print("NO SCREENSHOT FILE")
-          else:
-              print("Screenshot bytes:", os.path.getsize(p))
-          PY
-
-      - name: Stage Cerin macOS DMG on Desktop
+      - name: Install noVNC, websockify & Check Framebuffer
         env:
-          DMG_URL: ${{ inputs.dmg_url }}
-        run: |
-          mkdir -p "$HOME/Desktop"
-          DMG_NAME="$(basename "$DMG_URL")"
-          curl -fL --retry 3 "$DMG_URL" -o "$HOME/Desktop/$DMG_NAME"
-          ls -lh "$HOME/Desktop/$DMG_NAME"
-          shasum -a 256 "$HOME/Desktop/$DMG_NAME"
-
-      - name: Install noVNC, websockify & cloudflared
+          VNC_PASS: ${{ secrets.MACOS_VNC_PASSWORD }}
         run: |
           mkdir -p /tmp/vnc
           git clone --depth 1 https://github.com/novnc/noVNC.git /tmp/vnc/noVNC
-          # Force VNCAuth (Security Type 2, -setvncpw) instead of Apple ARD (Type 30) and ignore browser extension errors (e.g. MetaMask)
           python3 - <<'PY'
           import re
           rfb_path = "/tmp/vnc/noVNC/core/rfb.js"
           with open(rfb_path, "r") as f:
               txt = f.read()
+          # Force VNCAuth (Security Type 2) instead of Apple ARD (Type 30)
           txt = re.sub(r'(\bsecurityTypeARD\b\s*,)', '// disabled: \\1', txt, count=1)
           with open(rfb_path, "w") as f:
               f.write(txt)
@@ -102,31 +85,72 @@ jobs:
           with open(err_path, "w") as f:
               f.write(et)
           PY
+
           python3 -m venv /tmp/vnc/venv
           /tmp/vnc/venv/bin/pip install -q websockify
 
-          curl -fL "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-darwin-arm64.tgz" -o /tmp/vnc/cf.tgz
-          tar -xzf /tmp/vnc/cf.tgz -C /tmp/vnc
-          chmod +x /tmp/vnc/cloudflared
+          # Test actual RFB framebuffer from 127.0.0.1:5900
+          python3 - <<'PY' || true
+          import socket, struct, os
+          s = socket.create_connection(("127.0.0.1", 5900), timeout=5)
+          ver = s.recv(12)
+          print("RFB Server Version:", ver)
+          s.close()
+          PY
 
-      - name: Start Browser VNC Tunnel
+      - name: Start Browser VNC & SSH Tunnel (localhost.run / pinggy / cloudflared fallback)
         run: |
           nohup /tmp/vnc/venv/bin/websockify --web /tmp/vnc/noVNC 127.0.0.1:6080 127.0.0.1:5900 </dev/null >/tmp/vnc/websockify.log 2>&1 &
           sleep 2
 
-          nohup /tmp/vnc/cloudflared tunnel --no-autoupdate --url http://127.0.0.1:6080 </dev/null >/tmp/vnc/cf.log 2>&1 &
-
           TUNNEL_URL=""
-          for i in $(seq 1 30); do
-            TUNNEL_URL=$(grep -Eo 'https://[a-zA-Z0-9.-]+\.trycloudflare\.com' /tmp/vnc/cf.log | head -1 || true)
+
+          # 1. Try localhost.run (zero rate limits, supports WebSockets)
+          nohup ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ServerAliveInterval=30 -T -R 80:127.0.0.1:6080 nokey@localhost.run </dev/null >/tmp/vnc/lhr.log 2>&1 &
+          for i in $(seq 1 20); do
+            TUNNEL_URL=$(grep -Eo 'https://[a-zA-Z0-9.-]+\.(lhr\.life|localhost\.run)' /tmp/vnc/lhr.log | head -1 || true)
             if [ -n "$TUNNEL_URL" ]; then
+              echo "Got localhost.run tunnel: $TUNNEL_URL"
               break
             fi
             sleep 1
           done
 
+          # 2. Fallback to pinggy.io
           if [ -z "$TUNNEL_URL" ]; then
-            echo "ERROR: Failed to obtain Cloudflare quick tunnel URL."
+            echo "localhost.run failed, trying pinggy.io..."
+            cat /tmp/vnc/lhr.log || true
+            nohup ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ServerAliveInterval=30 -p 443 -T -R0:127.0.0.1:6080 a.pinggy.io </dev/null >/tmp/vnc/pinggy.log 2>&1 &
+            for i in $(seq 1 20); do
+              TUNNEL_URL=$(grep -Eo 'https://[a-zA-Z0-9.-]+\.a\.free\.pinggy\.link' /tmp/vnc/pinggy.log | head -1 || true)
+              if [ -n "$TUNNEL_URL" ]; then
+                echo "Got pinggy tunnel: $TUNNEL_URL"
+                break
+              fi
+              sleep 1
+            done
+          fi
+
+          # 3. Fallback to cloudflared
+          if [ -z "$TUNNEL_URL" ]; then
+            echo "pinggy failed, trying cloudflared..."
+            curl -fL "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-darwin-arm64.tgz" -o /tmp/vnc/cf.tgz
+            tar -xzf /tmp/vnc/cf.tgz -C /tmp/vnc
+            chmod +x /tmp/vnc/cloudflared
+            nohup /tmp/vnc/cloudflared tunnel --no-autoupdate --url http://127.0.0.1:6080 </dev/null >/tmp/vnc/cf.log 2>&1 &
+            for i in $(seq 1 25); do
+              TUNNEL_URL=$(grep -Eo 'https://[a-zA-Z0-9.-]+\.trycloudflare\.com' /tmp/vnc/cf.log | head -1 || true)
+              if [ -n "$TUNNEL_URL" ]; then
+                break
+              fi
+              sleep 1
+            done
+          fi
+
+          if [ -z "$TUNNEL_URL" ]; then
+            echo "ERROR: All tunnels failed."
+            cat /tmp/vnc/lhr.log || true
+            cat /tmp/vnc/pinggy.log || true
             cat /tmp/vnc/cf.log || true
             exit 1
           fi
@@ -134,15 +158,9 @@ jobs:
           FULL_URL="${TUNNEL_URL}/vnc.html?resize=scale&autoconnect=1"
           echo "MACOS_VNC_URL=${FULL_URL}"
           echo "$FULL_URL" > /tmp/vnc/vnc-url.txt
-          {
-            echo "### macOS VNC Session Ready"
-            echo ""
-            echo "- **URL:** $FULL_URL"
-            echo "- **DMG staged at:** \`~/Desktop/Cerin-1.3.2-arm64.dmg\`"
-            echo "- Use \`MACOS_VNC_PASSWORD\` when prompted."
-          } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Upload VNC URL artifact
+      - name: Upload VNC URL & Desktop Screenshot
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: macos-vnc-url
@@ -155,21 +173,12 @@ jobs:
         env:
           MINS: ${{ inputs.duration_minutes }}
         run: |
-          if ! nc -z 127.0.0.1 6080; then
-            echo "ERROR: websockify stopped between steps!"
-            cat /tmp/vnc/websockify.log || true
-            exit 1
-          fi
-          echo "VNC and Cloudflare tunnel active. Session running for up to ${MINS:-90} minutes."
+          nc -z 127.0.0.1 6080 || { echo "websockify not running"; exit 1; }
           MAX_MINS="${MINS:-90}"
           if [ "$MAX_MINS" -gt 180 ] 2>/dev/null; then MAX_MINS=180; fi
           SECONDS_LEFT=$((MAX_MINS * 60))
-
           while [ "$SECONDS_LEFT" -gt 0 ]; do
-            if [ -f "$HOME/Desktop/STOP_VNC" ]; then
-              echo "STOP_VNC detected, shutting down session."
-              break
-            fi
+            if [ -f "$HOME/Desktop/STOP_VNC" ]; then break; fi
             sleep 15
             SECONDS_LEFT=$((SECONDS_LEFT - 15))
           done
