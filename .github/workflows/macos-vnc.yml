@@ -21,11 +21,18 @@ jobs:
     timeout-minutes: 190
 
     steps:
-      - name: Prevent sleep and check hardware
+      - name: Prevent sleep, wake display, and inspect GUI state
         run: |
           echo "Host: $(uname -a)"
           sw_vers
-          sudo caffeinate -d -i -m -s >/dev/null 2>&1 &
+          sudo pmset -a displaysleep 0 sleep 0 disksleep 0 || true
+          sudo caffeinate -d -i -m -s -u </dev/null >/dev/null 2>&1 &
+          caffeinate -u -t 5 || true
+          echo "=== Displays ==="
+          system_profiler SPDisplaysDataType || true
+          echo "=== Users & GUI ==="
+          who || true
+          ps aux | grep -iE 'WindowServer|loginwindow|screensharing|ARDAgent' || true
 
       - name: Enable macOS Screen Sharing (VNC)
         env:
@@ -36,19 +43,31 @@ jobs:
             exit 1
           fi
           KICK="/System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart"
-          sudo "$KICK" -activate -configure -access -on -allowAccessFor -allUsers -privs -all -clientopts -setvnclegacy -vnclegacy yes -setvncpw -vncpw "$VNC_PASS" -restart -agent
-          sudo launchctl load -w /System/Library/LaunchDaemons/com.apple.screensharing.plist 2>/dev/null || true
+          sudo "$KICK" -activate -configure -access -on -allowAccessFor -allUsers -privs -all -clientopts -setvnclegacy -vnclegacy yes -setvncpw -vncpw "$VNC_PASS" -restart -agent -console
+          sudo launchctl kickstart -k system/com.apple.screensharing 2>/dev/null || sudo launchctl load -w /System/Library/LaunchDaemons/com.apple.screensharing.plist 2>/dev/null || true
 
           echo "Waiting for VNC port 5900..."
           for i in $(seq 1 20); do
             if nc -z 127.0.0.1 5900; then
               echo "VNC listening on 127.0.0.1:5900"
-              exit 0
+              break
             fi
             sleep 1
           done
-          echo "ERROR: VNC port 5900 did not come up."
-          exit 1
+          nc -z 127.0.0.1 5900 || { echo "ERROR: VNC port 5900 did not come up."; exit 1; }
+
+          open -a Finder "$HOME/Desktop" || true
+          sleep 2
+          screencapture -x /tmp/shot.png 2>&1 || true
+          ls -lh /tmp/shot.png || true
+          python3 - <<'PY'
+          import os, zlib, struct
+          p = "/tmp/shot.png"
+          if not os.path.exists(p):
+              print("NO SCREENSHOT FILE")
+          else:
+              print("Screenshot bytes:", os.path.getsize(p))
+          PY
 
       - name: Stage Cerin macOS DMG on Desktop
         env:
@@ -127,7 +146,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: macos-vnc-url
-          path: /tmp/vnc/vnc-url.txt
+          path: |
+            /tmp/vnc/vnc-url.txt
+            /tmp/shot.png
           retention-days: 1
 
       - name: Keep VNC Session Alive
