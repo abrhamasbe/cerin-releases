@@ -64,6 +64,25 @@ jobs:
         run: |
           mkdir -p /tmp/vnc
           git clone --depth 1 https://github.com/novnc/noVNC.git /tmp/vnc/noVNC
+          # Force VNCAuth (Security Type 2, -setvncpw) instead of Apple ARD (Type 30) and ignore browser extension errors (e.g. MetaMask)
+          python3 - <<'PY'
+          import re
+          rfb_path = "/tmp/vnc/noVNC/core/rfb.js"
+          with open(rfb_path, "r") as f:
+              txt = f.read()
+          txt = re.sub(r'(\bsecurityTypeARD\b\s*,)', '// disabled: \\1', txt, count=1)
+          with open(rfb_path, "w") as f:
+              f.write(txt)
+
+          err_path = "/tmp/vnc/noVNC/app/error-handler.js"
+          with open(err_path, "r") as f:
+              et = f.read()
+          guard = "if (String(event?.filename || event?.reason?.stack || '').includes('extension://') || String(event?.message || event?.reason?.message || event?.reason || '').includes('MetaMask')) { return false; }\n"
+          et = et.replace("function handleError(event, err) {", "function handleError(event, err) {\n    " + guard, 1)
+          et = et.replace("if ((event.message ===", guard + "        if ((event.message ===", 1)
+          with open(err_path, "w") as f:
+              f.write(et)
+          PY
           python3 -m venv /tmp/vnc/venv
           /tmp/vnc/venv/bin/pip install -q websockify
 
