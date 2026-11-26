@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       duration_minutes:
-        description: 'Session duration in minutes (max 180)'
+        description: 'Session duration in minutes (max 60 for free Pinggy tunnel)'
         required: false
-        default: '90'
+        default: '55'
         type: string
       dmg_url:
         description: 'macOS DMG URL to stage on Desktop'
@@ -18,7 +18,7 @@ jobs:
   macos-gui:
     name: Apple Silicon macOS Desktop (VNC)
     runs-on: macos-latest
-    timeout-minutes: 190
+    timeout-minutes: 70
 
     steps:
       - name: Prevent sleep, wake display, and stage Cerin DMG
@@ -39,7 +39,7 @@ jobs:
           screencapture -x /tmp/shot.png || true
           ls -lh /tmp/shot.png || true
 
-      - name: Enable macOS Screen Sharing & Check Virtual Display
+      - name: Enable macOS Screen Sharing (VNC)
         env:
           VNC_PASS: ${{ secrets.MACOS_VNC_PASSWORD }}
         run: |
@@ -60,7 +60,7 @@ jobs:
           done
           nc -z 127.0.0.1 5900 || { echo "ERROR: VNC port 5900 did not come up."; exit 1; }
 
-      - name: Install noVNC, websockify & Check Framebuffer
+      - name: Install noVNC, websockify & verify VNC framebuffer pixels
         env:
           VNC_PASS: ${{ secrets.MACOS_VNC_PASSWORD }}
         run: |
@@ -87,60 +87,79 @@ jobs:
           PY
 
           python3 -m venv /tmp/vnc/venv
-          /tmp/vnc/venv/bin/pip install -q websockify
+          /tmp/vnc/venv/bin/pip install -q websockify pycryptodome
 
-          # Test actual RFB framebuffer from 127.0.0.1:5900
           python3 - <<'PY' || true
           import socket, struct, os
-          s = socket.create_connection(("127.0.0.1", 5900), timeout=5)
+          from Crypto.Cipher import DES
+
+          def bitrev(b):
+              return int(f"{b:08b}"[::-1], 2)
+
+          pw = os.environ["VNC_PASS"].encode("latin1")[:8].ljust(8, b"\x00")
+          key = bytes(bitrev(b) for b in pw)
+
+          s = socket.create_connection(("127.0.0.1", 5900), timeout=8)
           ver = s.recv(12)
-          print("RFB Server Version:", ver)
+          print("RFB ver:", ver)
+          s.sendall(b"RFB 003.008\n")
+          n = s.recv(1)[0]
+          types = list(s.recv(n))
+          print("Security types:", types)
+          if 2 in types:
+              s.sendall(b"\x02")
+              chal = s.recv(16)
+              resp = DES.new(key, DES.MODE_ECB).encrypt(chal)
+              s.sendall(resp)
+              res = struct.unpack(">I", s.recv(4))[0]
+              print("VNCAuth result:", res)
+              if res == 0:
+                  s.sendall(b"\x01") # shared
+                  init = s.recv(24)
+                  w, h = struct.unpack(">HH", init[:4])
+                  name_len = struct.unpack(">I", init[20:24])[0]
+                  name = s.recv(name_len)
+                  print("Desktop:", w, "x", h, name)
+                  # SetEncodings (Raw = 0)
+                  s.sendall(struct.pack(">BBHi", 2, 0, 1, 0))
+                  # FramebufferUpdateRequest (full, non-incremental)
+                  s.sendall(struct.pack(">BBHHHH", 3, 0, 0, 0, w, h))
+                  hdr = s.recv(4)
+                  print("Update hdr:", hdr)
+                  chunk = s.recv(65536)
+                  nonzero = sum(1 for b in chunk if b != 0)
+                  print(f"Sampled {len(chunk)} framebuffer bytes, non-zero: {nonzero}")
           s.close()
           PY
 
-      - name: Start Browser VNC & SSH Tunnel (localhost.run / pinggy / cloudflared fallback)
+      - name: Start Browser VNC & 60-min Pinggy HTTPS Tunnel
         run: |
           nohup /tmp/vnc/venv/bin/websockify --web /tmp/vnc/noVNC 127.0.0.1:6080 127.0.0.1:5900 </dev/null >/tmp/vnc/websockify.log 2>&1 &
           sleep 2
 
           TUNNEL_URL=""
 
-          # 1. Try localhost.run (*.lhr.life)
-          nohup ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ServerAliveInterval=30 -T -R 80:127.0.0.1:6080 nokey@localhost.run </dev/null >/tmp/vnc/lhr.log 2>&1 &
-          for i in $(seq 1 20); do
-            TUNNEL_URL=$(grep -Eo 'https://[a-zA-Z0-9.-]+\.lhr\.life' /tmp/vnc/lhr.log | head -1 || true)
+          # 1. Pinggy.io (60-minute HTTPS/WSS tunnel, no rotation)
+          nohup ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ServerAliveInterval=30 -p 443 -T -R0:127.0.0.1:6080 a.pinggy.io </dev/null >/tmp/vnc/pinggy.log 2>&1 &
+          for i in $(seq 1 25); do
+            TUNNEL_URL=$(grep -Eo 'https://[a-zA-Z0-9.-]+\.(pinggy-free\.link|pinggy\.net)' /tmp/vnc/pinggy.log | head -1 || true)
             if [ -n "$TUNNEL_URL" ]; then
-              echo "Got localhost.run tunnel: $TUNNEL_URL"
+              echo "Got Pinggy tunnel: $TUNNEL_URL"
               break
             fi
             sleep 1
           done
 
-          # 2. Fallback to pinggy.io
+          # 2. Fallback to Bore.pub (TCP/HTTP tunnel)
           if [ -z "$TUNNEL_URL" ]; then
-            echo "localhost.run failed, trying pinggy.io..."
-            cat /tmp/vnc/lhr.log || true
-            nohup ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ServerAliveInterval=30 -p 443 -T -R0:127.0.0.1:6080 a.pinggy.io </dev/null >/tmp/vnc/pinggy.log 2>&1 &
+            echo "Pinggy failed, trying bore-cli..."
+            HOMEBREW_NO_AUTO_UPDATE=1 brew install bore-cli || true
+            nohup bore local 6080 --to bore.pub </dev/null >/tmp/vnc/bore.log 2>&1 &
             for i in $(seq 1 20); do
-              TUNNEL_URL=$(grep -Eo 'https://[a-zA-Z0-9.-]+\.(pinggy-free\.link|pinggy\.net)' /tmp/vnc/pinggy.log | head -1 || true)
-              if [ -n "$TUNNEL_URL" ]; then
-                echo "Got pinggy tunnel: $TUNNEL_URL"
-                break
-              fi
-              sleep 1
-            done
-          fi
-
-          # 3. Fallback to cloudflared
-          if [ -z "$TUNNEL_URL" ]; then
-            echo "pinggy failed, trying cloudflared..."
-            curl -fL "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-darwin-arm64.tgz" -o /tmp/vnc/cf.tgz
-            tar -xzf /tmp/vnc/cf.tgz -C /tmp/vnc
-            chmod +x /tmp/vnc/cloudflared
-            nohup /tmp/vnc/cloudflared tunnel --no-autoupdate --url http://127.0.0.1:6080 </dev/null >/tmp/vnc/cf.log 2>&1 &
-            for i in $(seq 1 25); do
-              TUNNEL_URL=$(grep -Eo 'https://[a-zA-Z0-9.-]+\.trycloudflare\.com' /tmp/vnc/cf.log | head -1 || true)
-              if [ -n "$TUNNEL_URL" ]; then
+              BORE_HOST=$(grep -Eo 'bore\.pub:[0-9]+' /tmp/vnc/bore.log | head -1 || true)
+              if [ -n "$BORE_HOST" ]; then
+                TUNNEL_URL="http://${BORE_HOST}"
+                echo "Got Bore tunnel: $TUNNEL_URL"
                 break
               fi
               sleep 1
@@ -149,9 +168,8 @@ jobs:
 
           if [ -z "$TUNNEL_URL" ]; then
             echo "ERROR: All tunnels failed."
-            cat /tmp/vnc/lhr.log || true
             cat /tmp/vnc/pinggy.log || true
-            cat /tmp/vnc/cf.log || true
+            cat /tmp/vnc/bore.log || true
             exit 1
           fi
 
@@ -174,8 +192,8 @@ jobs:
           MINS: ${{ inputs.duration_minutes }}
         run: |
           nc -z 127.0.0.1 6080 || { echo "websockify not running"; exit 1; }
-          MAX_MINS="${MINS:-90}"
-          if [ "$MAX_MINS" -gt 180 ] 2>/dev/null; then MAX_MINS=180; fi
+          MAX_MINS="${MINS:-55}"
+          if [ "$MAX_MINS" -gt 60 ] 2>/dev/null; then MAX_MINS=60; fi
           SECONDS_LEFT=$((MAX_MINS * 60))
           while [ "$SECONDS_LEFT" -gt 0 ]; do
             if [ -f "$HOME/Desktop/STOP_VNC" ]; then break; fi
