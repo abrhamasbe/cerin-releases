@@ -11,7 +11,7 @@ on:
       dmg_url:
         description: 'macOS DMG URL to stage on Desktop'
         required: false
-        default: 'https://releases.cerin.space/Cerin-1.3.2-arm64.dmg'
+        default: 'https://releases.cerin.space/Cerin-1.3.3-arm64.dmg'
         type: string
 
 jobs:
