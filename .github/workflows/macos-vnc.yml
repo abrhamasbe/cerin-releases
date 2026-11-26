@@ -25,7 +25,7 @@ jobs:
         run: |
           echo "Host: $(uname -a)"
           sw_vers
-          sudo caffeinate -d -i -m -s &
+          sudo caffeinate -d -i -m -s >/dev/null 2>&1 &
 
       - name: Enable macOS Screen Sharing (VNC)
         env:
@@ -35,14 +35,12 @@ jobs:
             echo "ERROR: MACOS_VNC_PASSWORD secret is not set."
             exit 1
           fi
-          sudo dscl . -passwd /Users/runner "$VNC_PASS"
           KICK="/System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart"
-          sudo "$KICK" -configure -allowAccessFor -allUsers -privs -all
-          sudo "$KICK" -configure -clientopts -setvnclegacy -vnclegacy yes -setvncpw -vncpw "$VNC_PASS"
-          sudo "$KICK" -activate -restart -agent
+          sudo "$KICK" -activate -configure -access -on -allowAccessFor -allUsers -privs -all -clientopts -setvnclegacy -vnclegacy yes -setvncpw -vncpw "$VNC_PASS" -restart -agent
+          sudo launchctl load -w /System/Library/LaunchDaemons/com.apple.screensharing.plist 2>/dev/null || true
 
           echo "Waiting for VNC port 5900..."
-          for i in $(seq 1 15); do
+          for i in $(seq 1 20); do
             if nc -z 127.0.0.1 5900; then
               echo "VNC listening on 127.0.0.1:5900"
               exit 0
@@ -61,7 +59,6 @@ jobs:
           curl -fL --retry 3 "$DMG_URL" -o "$HOME/Desktop/$DMG_NAME"
           ls -lh "$HOME/Desktop/$DMG_NAME"
           shasum -a 256 "$HOME/Desktop/$DMG_NAME"
-          curl -fsSL https://releases.cerin.space/SHA256SUMS.txt || true
 
       - name: Install noVNC, websockify & cloudflared
         run: |
@@ -74,14 +71,12 @@ jobs:
           tar -xzf /tmp/vnc/cf.tgz -C /tmp/vnc
           chmod +x /tmp/vnc/cloudflared
 
-      - name: Start Browser VNC Tunnel & Keep Session Alive
-        env:
-          MINS: ${{ inputs.duration_minutes }}
+      - name: Start Browser VNC Tunnel
         run: |
-          nohup /tmp/vnc/venv/bin/websockify --web /tmp/vnc/noVNC 127.0.0.1:6080 127.0.0.1:5900 >/tmp/vnc/websockify.log 2>&1 &
+          nohup /tmp/vnc/venv/bin/websockify --web /tmp/vnc/noVNC 127.0.0.1:6080 127.0.0.1:5900 </dev/null >/tmp/vnc/websockify.log 2>&1 &
           sleep 2
 
-          nohup /tmp/vnc/cloudflared tunnel --no-autoupdate --url http://127.0.0.1:6080 >/tmp/vnc/cf.log 2>&1 &
+          nohup /tmp/vnc/cloudflared tunnel --no-autoupdate --url http://127.0.0.1:6080 </dev/null >/tmp/vnc/cf.log 2>&1 &
 
           TUNNEL_URL=""
           for i in $(seq 1 30); do
@@ -98,12 +93,34 @@ jobs:
             exit 1
           fi
 
-          echo "=========================================================="
-          echo "MACOS_VNC_URL=${TUNNEL_URL}/vnc.html?resize=scale&autoconnect=1"
-          echo "Use MACOS_VNC_PASSWORD from your private secret when prompted."
-          echo "Touch ~/Desktop/STOP_VNC or cancel workflow to end early."
-          echo "=========================================================="
+          FULL_URL="${TUNNEL_URL}/vnc.html?resize=scale&autoconnect=1"
+          echo "MACOS_VNC_URL=${FULL_URL}"
+          echo "$FULL_URL" > /tmp/vnc/vnc-url.txt
+          {
+            echo "### macOS VNC Session Ready"
+            echo ""
+            echo "- **URL:** $FULL_URL"
+            echo "- **DMG staged at:** \`~/Desktop/Cerin-1.3.2-arm64.dmg\`"
+            echo "- Use \`MACOS_VNC_PASSWORD\` when prompted."
+          } >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Upload VNC URL artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-vnc-url
+          path: /tmp/vnc/vnc-url.txt
+          retention-days: 1
+
+      - name: Keep VNC Session Alive
+        env:
+          MINS: ${{ inputs.duration_minutes }}
+        run: |
+          if ! nc -z 127.0.0.1 6080; then
+            echo "ERROR: websockify stopped between steps!"
+            cat /tmp/vnc/websockify.log || true
+            exit 1
+          fi
+          echo "VNC and Cloudflare tunnel active. Session running for up to ${MINS:-90} minutes."
           MAX_MINS="${MINS:-90}"
           if [ "$MAX_MINS" -gt 180 ] 2>/dev/null; then MAX_MINS=180; fi
           SECONDS_LEFT=$((MAX_MINS * 60))
