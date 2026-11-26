@@ -16,7 +16,7 @@ on:
 
 jobs:
   macos-gui:
-    name: Apple Silicon macOS Desktop (VNC)
+    name: Apple Silicon macOS Desktop (Interactive)
     runs-on: macos-latest
     timeout-minutes: 70
 
@@ -35,11 +35,8 @@ jobs:
           curl -fL --retry 3 "$DMG_URL" -o "$HOME/Desktop/$DMG_NAME"
           ls -lh "$HOME/Desktop/$DMG_NAME"
           open -a Finder "$HOME/Desktop" || true
-          sleep 2
-          screencapture -x /tmp/shot.png || true
-          ls -lh /tmp/shot.png || true
 
-      - name: Enable macOS Screen Sharing (VNC)
+      - name: Enable macOS Screen Sharing (RFB input channel)
         env:
           VNC_PASS: ${{ secrets.MACOS_VNC_PASSWORD }}
         run: |
@@ -53,113 +50,532 @@ jobs:
 
           for i in $(seq 1 20); do
             if nc -z 127.0.0.1 5900; then
-              echo "VNC listening on 127.0.0.1:5900"
+              echo "RFB listening on 127.0.0.1:5900"
               break
             fi
             sleep 1
           done
-          nc -z 127.0.0.1 5900 || { echo "ERROR: VNC port 5900 did not come up."; exit 1; }
+          nc -z 127.0.0.1 5900 || { echo "ERROR: port 5900 not up"; exit 1; }
 
-      - name: Install noVNC, websockify & verify VNC framebuffer pixels
+      - name: Setup HTML5 Interactive Mac Desktop Server
+        run: |
+          mkdir -p /tmp/macdesk
+          python3 -m venv /tmp/macdesk/venv
+          /tmp/macdesk/venv/bin/pip install -q pycryptodome
+
+          cat <<'PY' > /tmp/macdesk/server.py
+          import hashlib, hmac, http.cookies, json, os, shutil, socket, struct, subprocess, threading, time
+          from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+          from Crypto.Cipher import DES
+
+          PASS = os.environ["VNC_PASS"]
+          SECRET = hashlib.sha256((PASS + ":cerin-mac-console").encode()).hexdigest()
+          AUTH_TOKEN = hmac.new(SECRET.encode(), b"macdesk-session", hashlib.sha256).hexdigest()
+
+          FRAME_PATH = "/tmp/macdesk/frame.jpg"
+          FRAME_TMP = "/tmp/macdesk/frame_tmp.jpg"
+          last_client_seen = time.time()
+          capture_lock = threading.Lock()
+
+          def capture_once():
+              with capture_lock:
+                  subprocess.run(
+                      ["screencapture", "-x", "-t", "jpg", "-C", FRAME_TMP],
+                      stdout=subprocess.DEVNULL,
+                      stderr=subprocess.DEVNULL,
+                      timeout=5,
+                  )
+                  if os.path.exists(FRAME_TMP) and os.path.getsize(FRAME_TMP) > 0:
+                      os.replace(FRAME_TMP, FRAME_PATH)
+
+          def capture_loop():
+              capture_once()
+              while True:
+                  if time.time() - last_client_seen < 20:
+                      try:
+                          capture_once()
+                      except Exception:
+                          pass
+                      time.sleep(0.25)
+                  else:
+                      time.sleep(0.6)
+
+          class RFBInput:
+              def __init__(self):
+                  self.lock = threading.Lock()
+                  self.sock = None
+                  self.w = 1024
+                  self.h = 768
+
+              @staticmethod
+              def _bitrev(b):
+                  return int(f"{b:08b}"[::-1], 2)
+
+              def _connect(self):
+                  if self.sock:
+                      return
+                  pw = PASS.encode("latin1")[:8].ljust(8, b"\x00")
+                  key = bytes(self._bitrev(b) for b in pw)
+                  s = socket.create_connection(("127.0.0.1", 5900), timeout=6)
+                  s.recv(12)
+                  s.sendall(b"RFB 003.008\n")
+                  n = s.recv(1)[0]
+                  types = list(s.recv(n))
+                  if 2 not in types:
+                      raise RuntimeError(f"VNCAuth(2) missing in {types}")
+                  s.sendall(b"\x02")
+                  chal = s.recv(16)
+                  s.sendall(DES.new(key, DES.MODE_ECB).encrypt(chal))
+                  res = struct.unpack(">I", s.recv(4))[0]
+                  if res != 0:
+                      raise RuntimeError(f"VNCAuth failed: {res}")
+                  s.sendall(b"\x01")
+                  init = s.recv(24)
+                  self.w, self.h = struct.unpack(">HH", init[:4])
+                  name_len = struct.unpack(">I", init[20:24])[0]
+                  s.recv(name_len)
+                  self.sock = s
+
+              def _send(self, payload):
+                  with self.lock:
+                      for attempt in range(2):
+                          try:
+                              self._connect()
+                              self.sock.sendall(payload)
+                              return
+                          except Exception:
+                              try:
+                                  self.sock.close()
+                              except Exception:
+                                  pass
+                              self.sock = None
+
+              def pointer(self, mask, nx, ny):
+                  x = max(0, min(self.w - 1, int(round(nx * self.w))))
+                  y = max(0, min(self.h - 1, int(round(ny * self.h))))
+                  self._send(struct.pack(">BBHH", 5, mask, x, y))
+
+              def click(self, nx, ny, button=1, count=1):
+                  for _ in range(count):
+                      self.pointer(button, nx, ny)
+                      time.sleep(0.03)
+                      self.pointer(0, nx, ny)
+                      time.sleep(0.05)
+
+              def scroll(self, nx, ny, dy):
+                  btn = 8 if dy < 0 else 16
+                  steps = max(1, min(6, abs(int(dy))))
+                  for _ in range(steps):
+                      self.pointer(btn, nx, ny)
+                      self.pointer(0, nx, ny)
+
+              def key(self, keysym, down):
+                  self._send(struct.pack(">BBHI", 4, 1 if down else 0, 0, keysym))
+
+              def tap_key(self, keysym, mods=()):
+                  for m in mods:
+                      self.key(m, True)
+                  self.key(keysym, True)
+                  time.sleep(0.02)
+                  self.key(keysym, False)
+                  for m in reversed(mods):
+                      self.key(m, False)
+
+              def type_text(self, text):
+                  for ch in text:
+                      code = ord(ch)
+                      if ch == "\n":
+                          self.tap_key(0xFF0D)
+                      elif ch == "\t":
+                          self.tap_key(0xFF09)
+                      elif 32 <= code <= 126:
+                          self.tap_key(code)
+
+          rfb = RFBInput()
+
+          SPECIAL_KEYS = {
+              "Enter": 0xFF0D,
+              "Backspace": 0xFF08,
+              "Tab": 0xFF09,
+              "Escape": 0xFF1B,
+              "Delete": 0xFFFF,
+              "ArrowLeft": 0xFF51,
+              "ArrowUp": 0xFF52,
+              "ArrowRight": 0xFF53,
+              "ArrowDown": 0xFF54,
+              "Home": 0xFF50,
+              "End": 0xFF57,
+              "Space": 0x0020,
+          }
+
+          HTML_PAGE = """<!doctype html>
+          <html lang="en">
+          <head>
+            <meta charset="utf-8" />
+            <meta name="viewport" content="width=device-width,initial-scale=1" />
+            <title>Apple Silicon macOS Desktop — Cerin Test Console</title>
+            <style>
+              * { box-sizing: border-box; }
+              body { margin: 0; background: #09090b; color: #f4f4f5; font-family: system-ui,-apple-system,sans-serif; height: 100vh; display: flex; flex-direction: column; overflow: hidden; }
+              header { height: 48px; border-bottom: 1px solid rgba(255,255,255,0.08); background: #111114; display: flex; align-items: center; justify-content: space-between; padding: 0 14px; gap: 10px; shrink: 0; }
+              .brand { font-size: 13px; font-weight: 600; display: flex; align-items: center; gap: 8px; }
+              .dot { width: 8px; height: 8px; border-radius: 99px; background: #10b981; }
+              .bar { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+              button, input[type=text], input[type=password] { font-family: inherit; font-size: 12px; border-radius: 8px; border: 1px solid rgba(255,255,255,0.12); background: #18181b; color: #f4f4f5; padding: 5px 10px; cursor: pointer; }
+              button:hover { background: #27272a; }
+              button.primary { background: #fff; color: #09090b; font-weight: 600; border-color: #fff; }
+              button.primary:hover { background: #e4e4e7; }
+              .main { flex: 1; display: flex; min-height: 0; }
+              .stage { flex: 1; display: flex; align-items: center; justify-content: center; padding: 10px; background: #050507; position: relative; overflow: hidden; }
+              #screen { max-width: 100%; max-height: 100%; border-radius: 8px; border: 1px solid rgba(255,255,255,0.1); box-shadow: 0 20px 60px rgba(0,0,0,0.8); user-select: none; -webkit-user-drag: none; cursor: crosshair; }
+              .side { width: 320px; border-left: 1px solid rgba(255,255,255,0.08); background: #111114; display: flex; flex-direction: column; padding: 12px; gap: 10px; }
+              .side h3 { margin: 0; font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; color: #a1a1aa; }
+              .log { flex: 1; background: #09090b; border: 1px solid rgba(255,255,255,0.08); border-radius: 8px; padding: 8px; font-family: ui-monospace,monospace; font-size: 11px; color: #d4d4d8; overflow: auto; white-space: pre-wrap; }
+              .row { display: flex; gap: 6px; }
+              .row input { flex: 1; cursor: text; }
+              #authModal { position: fixed; inset: 0; background: rgba(9,9,11,0.96); display: flex; align-items: center; justify-content: center; z-index: 50; }
+              .card { width: 320px; background: #111114; border: 1px solid rgba(255,255,255,0.12); border-radius: 14px; padding: 22px; display: flex; flex-direction: column; gap: 12px; }
+              .hidden { display: none !important; }
+            </style>
+          </head>
+          <body>
+            <div id="authModal" class="__AUTH_CLASS__">
+              <form class="card" onsubmit="doLogin(event)">
+                <div style="font-weight:600;font-size:15px;">macOS Apple Silicon Console</div>
+                <div style="font-size:12px;color:#a1a1aa;">Enter your session password to unlock desktop &amp; controls.</div>
+                <input id="pw" type="password" placeholder="Password" autofocus style="width:100%;padding:8px 10px;" />
+                <div id="authErr" style="color:#f87171;font-size:12px;display:none;"></div>
+                <button type="submit" class="primary" style="padding:8px;">Connect to Mac</button>
+              </form>
+            </div>
+
+            <header>
+              <div class="brand"><span class="dot"></span> macOS 26 (Apple Silicon)</div>
+              <div class="bar">
+                <button onclick="runCmd('open -a Finder ~/Desktop')">Finder Desktop</button>
+                <button onclick="runCmd('open -a Terminal')">Terminal</button>
+                <button class="primary" onclick="installCerin()">Install &amp; Launch Cerin.app</button>
+                <button onclick="runCmd('xattr -cr /Applications/Cerin.app && open /Applications/Cerin.app')">Bypass Gatekeeper &amp; Open</button>
+                <button onclick="sendKey('Escape')">Esc</button>
+                <button onclick="sendKey('Enter')">Return</button>
+                <button onclick="refreshFrame()">Refresh</button>
+              </div>
+            </header>
+
+            <div class="main">
+              <div class="stage">
+                <img id="screen" alt="macOS Desktop" tabindex="0" />
+              </div>
+              <div class="side">
+                <h3>Type into Mac Window</h3>
+                <form class="row" onsubmit="sendTyped(event)">
+                  <input id="typeBox" type="text" placeholder="Type text + Enter..." />
+                  <button type="submit">Send</button>
+                </form>
+
+                <h3 style="margin-top:6px;">Run Mac Terminal Command</h3>
+                <form class="row" onsubmit="execForm(event)">
+                  <input id="cmdBox" type="text" placeholder="e.g. ls -la /Applications" />
+                  <button type="submit">Run</button>
+                </form>
+                <div id="cmdOut" class="log">Ready. Click the Mac screen directly to interact, or click "Install & Launch Cerin.app" above.</div>
+              </div>
+            </div>
+
+            <script>
+              let authed = __AUTH_BOOL__;
+              const img = document.getElementById('screen');
+              const out = document.getElementById('cmdOut');
+
+              async function doLogin(e) {
+                e.preventDefault();
+                const pw = document.getElementById('pw').value;
+                const r = await fetch('/api/login', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({password: pw}) });
+                const j = await r.json();
+                if (j.ok) {
+                  authed = true;
+                  document.getElementById('authModal').classList.add('hidden');
+                  startStream();
+                } else {
+                  const err = document.getElementById('authErr');
+                  err.textContent = j.error || 'Wrong password';
+                  err.style.display = 'block';
+                }
+              }
+
+              let inflight = false;
+              async function refreshFrame() {
+                if (!authed || inflight) return;
+                inflight = true;
+                try {
+                  const r = await fetch('/api/frame.jpg?t=' + Date.now());
+                  if (r.status === 401) { authed = false; document.getElementById('authModal').classList.remove('hidden'); return; }
+                  if (r.ok) {
+                    const blob = await r.blob();
+                    const url = URL.createObjectURL(blob);
+                    const old = img.src;
+                    img.src = url;
+                    if (old && old.startsWith('blob:')) URL.revokeObjectURL(old);
+                  }
+                } finally {
+                  inflight = false;
+                }
+              }
+
+              function startStream() {
+                refreshFrame();
+                setInterval(refreshFrame, 450);
+              }
+
+              function normCoords(e) {
+                const rect = img.getBoundingClientRect();
+                return {
+                  nx: Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width)),
+                  ny: Math.max(0, Math.min(1, (e.clientY - rect.top) / rect.height)),
+                };
+              }
+
+              img.addEventListener('click', async (e) => {
+                img.focus();
+                const {nx, ny} = normCoords(e);
+                await fetch('/api/mouse', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({type: 'click', nx, ny}) });
+                setTimeout(refreshFrame, 150);
+              });
+
+              img.addEventListener('dblclick', async (e) => {
+                const {nx, ny} = normCoords(e);
+                await fetch('/api/mouse', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({type: 'dblclick', nx, ny}) });
+                setTimeout(refreshFrame, 200);
+              });
+
+              img.addEventListener('contextmenu', async (e) => {
+                e.preventDefault();
+                const {nx, ny} = normCoords(e);
+                await fetch('/api/mouse', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({type: 'rightclick', nx, ny}) });
+                setTimeout(refreshFrame, 150);
+              });
+
+              img.addEventListener('wheel', async (e) => {
+                e.preventDefault();
+                const {nx, ny} = normCoords(e);
+                await fetch('/api/mouse', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({type: 'scroll', nx, ny, dy: e.deltaY > 0 ? 2 : -2}) });
+                setTimeout(refreshFrame, 150);
+              }, { passive: false });
+
+              img.addEventListener('keydown', async (e) => {
+                if (document.activeElement !== img) return;
+                e.preventDefault();
+                if (e.key.length === 1 && !e.metaKey && !e.ctrlKey) {
+                  await fetch('/api/key', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({text: e.key}) });
+                } else {
+                  await fetch('/api/key', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({key: e.key}) });
+                }
+                setTimeout(refreshFrame, 150);
+              });
+
+              async function sendKey(k) {
+                await fetch('/api/key', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({key: k}) });
+                setTimeout(refreshFrame, 150);
+              }
+
+              async function sendTyped(e) {
+                e.preventDefault();
+                const inp = document.getElementById('typeBox');
+                const val = inp.value;
+                if (!val) return;
+                inp.value = '';
+                await fetch('/api/key', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({text: val + '\\n'}) });
+                setTimeout(refreshFrame, 200);
+              }
+
+              async function runCmd(cmd) {
+                out.textContent = '$ ' + cmd + '\\nRunning...';
+                const r = await fetch('/api/exec', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({cmd}) });
+                const j = await r.json();
+                out.textContent = '$ ' + cmd + '\\n' + (j.output || '(no output)');
+                setTimeout(refreshFrame, 300);
+              }
+
+              async function execForm(e) {
+                e.preventDefault();
+                const inp = document.getElementById('cmdBox');
+                if (!inp.value.trim()) return;
+                const c = inp.value.trim();
+                inp.value = '';
+                await runCmd(c);
+              }
+
+              async function installCerin() {
+                await runCmd(`set -e
+          MNT=$(mktemp -d /tmp/cerin-mnt.XXXX)
+          hdiutil attach ~/Desktop/Cerin-*.dmg -mountpoint "$MNT" -nobrowse -quiet
+          rm -rf /Applications/Cerin.app
+          cp -R "$MNT/Cerin.app" /Applications/
+          hdiutil detach "$MNT" -quiet || true
+          xattr -cr /Applications/Cerin.app || true
+          open /Applications/Cerin.app
+          echo "Launched /Applications/Cerin.app"`);
+              }
+
+              if (authed) startStream();
+            </script>
+          </body>
+          </html>"""
+
+          class Handler(BaseHTTPRequestHandler):
+              def log_message(self, fmt, *args):
+                  pass
+
+              def _is_authed(self):
+                  c = http.cookies.SimpleCookie(self.headers.get("Cookie", ""))
+                  m = c.get("mac_auth")
+                  return bool(m and hmac.compare_digest(m.value, AUTH_TOKEN))
+
+              def _json(self, code, obj, cookie=None):
+                  body = json.dumps(obj).encode()
+                  self.send_response(code)
+                  self.send_header("Content-Type", "application/json")
+                  self.send_header("Content-Length", str(len(body)))
+                  if cookie:
+                      self.send_header("Set-Cookie", cookie)
+                  self.end_headers()
+                  self.wfile.write(body)
+
+              def _read_json(self):
+                  ln = int(self.headers.get("Content-Length", "0") or 0)
+                  raw = self.rfile.read(ln) if ln > 0 else b"{}"
+                  return json.loads(raw.decode() or "{}")
+
+              def do_GET(self):
+                  global last_client_seen
+                  path = self.path.split("?", 1)[0]
+                  if path == "/" or path == "/index.html":
+                      authed = self._is_authed()
+                      if authed:
+                          last_client_seen = time.time()
+                      html = (
+                          HTML_PAGE.replace("__AUTH_CLASS__", "hidden" if authed else "")
+                          .replace("__AUTH_BOOL__", "true" if authed else "false")
+                          .encode()
+                      )
+                      self.send_response(200)
+                      self.send_header("Content-Type", "text/html; charset=utf-8")
+                      self.send_header("Cache-Control", "no-store")
+                      self.send_header("Content-Length", str(len(html)))
+                      self.end_headers()
+                      self.wfile.write(html)
+                      return
+
+                  if path == "/api/frame.jpg":
+                      if not self._is_authed():
+                          self.send_response(401)
+                          self.end_headers()
+                          return
+                      last_client_seen = time.time()
+                      if not os.path.exists(FRAME_PATH):
+                          capture_once()
+                      with open(FRAME_PATH, "rb") as f:
+                          data = f.read()
+                      self.send_response(200)
+                      self.send_header("Content-Type", "image/jpeg")
+                      self.send_header("Cache-Control", "no-store")
+                      self.send_header("Content-Length", str(len(data)))
+                      self.end_headers()
+                      self.wfile.write(data)
+                      return
+
+                  self.send_response(404)
+                  self.end_headers()
+
+              def do_POST(self):
+                  global last_client_seen
+                  path = self.path.split("?", 1)[0]
+                  if path == "/api/login":
+                      body = self._read_json()
+                      if hmac.compare_digest(str(body.get("password", "")), PASS):
+                          last_client_seen = time.time()
+                          self._json(200, {"ok": True}, cookie=f"mac_auth={AUTH_TOKEN}; Path=/; HttpOnly; SameSite=Lax")
+                      else:
+                          self._json(401, {"ok": False, "error": "Invalid password"})
+                      return
+
+                  if not self._is_authed():
+                      self._json(401, {"ok": False, "error": "Unauthorized"})
+                      return
+
+                  last_client_seen = time.time()
+                  body = self._read_json()
+
+                  if path == "/api/mouse":
+                      t = body.get("type", "click")
+                      nx = float(body.get("nx", 0.5))
+                      ny = float(body.get("ny", 0.5))
+                      if t == "click":
+                          rfb.click(nx, ny, button=1, count=1)
+                      elif t == "dblclick":
+                          rfb.click(nx, ny, button=1, count=2)
+                      elif t == "rightclick":
+                          rfb.click(nx, ny, button=4, count=1)
+                      elif t == "scroll":
+                          rfb.scroll(nx, ny, body.get("dy", 1))
+                      threading.Timer(0.12, capture_once).start()
+                      self._json(200, {"ok": True})
+                      return
+
+                  if path == "/api/key":
+                      if "text" in body:
+                          rfb.type_text(str(body["text"]))
+                      elif "key" in body:
+                          ks = SPECIAL_KEYS.get(str(body["key"]))
+                          if ks:
+                              rfb.tap_key(ks)
+                      threading.Timer(0.12, capture_once).start()
+                      self._json(200, {"ok": True})
+                      return
+
+                  if path == "/api/exec":
+                      cmd = str(body.get("cmd", ""))
+                      try:
+                          p = subprocess.run(["/bin/bash", "-lc", cmd], capture_output=True, text=True, timeout=60)
+                          out = (p.stdout or "") + (p.stderr or "")
+                          threading.Timer(0.25, capture_once).start()
+                          self._json(200, {"ok": p.returncode == 0, "code": p.returncode, "output": out.strip()})
+                      except Exception as e:
+                          self._json(500, {"ok": False, "output": str(e)})
+                      return
+
+                  self._json(404, {"ok": False})
+
+          threading.Thread(target=capture_loop, daemon=True).start()
+          ThreadingHTTPServer(("127.0.0.1", 6080), Handler).serve_forever()
+          PY
+
+      - name: Start Mac Desktop Server & 60-min Pinggy HTTPS Tunnel
         env:
           VNC_PASS: ${{ secrets.MACOS_VNC_PASSWORD }}
         run: |
-          mkdir -p /tmp/vnc
-          git clone --depth 1 https://github.com/novnc/noVNC.git /tmp/vnc/noVNC
-          python3 - <<'PY'
-          import re
-          rfb_path = "/tmp/vnc/noVNC/core/rfb.js"
-          with open(rfb_path, "r") as f:
-              txt = f.read()
-          # Force VNCAuth (Security Type 2) instead of Apple ARD (Type 30)
-          txt = re.sub(r'(\bsecurityTypeARD\b\s*,)', '// disabled: \\1', txt, count=1)
-          with open(rfb_path, "w") as f:
-              f.write(txt)
-
-          err_path = "/tmp/vnc/noVNC/app/error-handler.js"
-          with open(err_path, "r") as f:
-              et = f.read()
-          guard = "if (String(event?.filename || event?.reason?.stack || '').includes('extension://') || String(event?.message || event?.reason?.message || event?.reason || '').includes('MetaMask')) { return false; }\n"
-          et = et.replace("function handleError(event, err) {", "function handleError(event, err) {\n    " + guard, 1)
-          et = et.replace("if ((event.message ===", guard + "        if ((event.message ===", 1)
-          with open(err_path, "w") as f:
-              f.write(et)
-          PY
-
-          python3 -m venv /tmp/vnc/venv
-          /tmp/vnc/venv/bin/pip install -q websockify pycryptodome
-
-          python3 - <<'PY' || true
-          import socket, struct, os
-          from Crypto.Cipher import DES
-
-          def bitrev(b):
-              return int(f"{b:08b}"[::-1], 2)
-
-          pw = os.environ["VNC_PASS"].encode("latin1")[:8].ljust(8, b"\x00")
-          key = bytes(bitrev(b) for b in pw)
-
-          s = socket.create_connection(("127.0.0.1", 5900), timeout=8)
-          ver = s.recv(12)
-          print("RFB ver:", ver)
-          s.sendall(b"RFB 003.008\n")
-          n = s.recv(1)[0]
-          types = list(s.recv(n))
-          print("Security types:", types)
-          if 2 in types:
-              s.sendall(b"\x02")
-              chal = s.recv(16)
-              resp = DES.new(key, DES.MODE_ECB).encrypt(chal)
-              s.sendall(resp)
-              res = struct.unpack(">I", s.recv(4))[0]
-              print("VNCAuth result:", res)
-              if res == 0:
-                  s.sendall(b"\x01") # shared
-                  init = s.recv(24)
-                  w, h = struct.unpack(">HH", init[:4])
-                  name_len = struct.unpack(">I", init[20:24])[0]
-                  name = s.recv(name_len)
-                  print("Desktop:", w, "x", h, name)
-                  # SetEncodings (Raw = 0)
-                  s.sendall(struct.pack(">BBHi", 2, 0, 1, 0))
-                  # FramebufferUpdateRequest (full, non-incremental)
-                  s.sendall(struct.pack(">BBHHHH", 3, 0, 0, 0, w, h))
-                  hdr = s.recv(4)
-                  print("Update hdr:", hdr)
-                  chunk = s.recv(65536)
-                  nonzero = sum(1 for b in chunk if b != 0)
-                  print(f"Sampled {len(chunk)} framebuffer bytes, non-zero: {nonzero}")
-          s.close()
-          PY
-
-      - name: Start Browser VNC & 60-min Pinggy HTTPS Tunnel
-        run: |
-          nohup /tmp/vnc/venv/bin/websockify --web /tmp/vnc/noVNC 127.0.0.1:6080 127.0.0.1:5900 </dev/null >/tmp/vnc/websockify.log 2>&1 &
+          nohup env VNC_PASS="$VNC_PASS" /tmp/macdesk/venv/bin/python /tmp/macdesk/server.py </dev/null >/tmp/macdesk/server.log 2>&1 &
           sleep 2
+          nc -z 127.0.0.1 6080 || { cat /tmp/macdesk/server.log; exit 1; }
 
           TUNNEL_URL=""
-
-          # 1. Pinggy.io (60-minute HTTPS/WSS tunnel, no rotation)
-          nohup ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ServerAliveInterval=30 -p 443 -T -R0:127.0.0.1:6080 a.pinggy.io </dev/null >/tmp/vnc/pinggy.log 2>&1 &
+          nohup ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ServerAliveInterval=30 -p 443 -T -R0:127.0.0.1:6080 a.pinggy.io </dev/null >/tmp/macdesk/pinggy.log 2>&1 &
           for i in $(seq 1 25); do
-            TUNNEL_URL=$(grep -Eo 'https://[a-zA-Z0-9.-]+\.(pinggy-free\.link|pinggy\.net)' /tmp/vnc/pinggy.log | head -1 || true)
+            TUNNEL_URL=$(grep -Eo 'https://[a-zA-Z0-9.-]+\.(pinggy-free\.link|pinggy\.net)' /tmp/macdesk/pinggy.log | head -1 || true)
             if [ -n "$TUNNEL_URL" ]; then
-              echo "Got Pinggy tunnel: $TUNNEL_URL"
               break
             fi
             sleep 1
           done
 
-          # 2. Fallback to Bore.pub (TCP/HTTP tunnel)
           if [ -z "$TUNNEL_URL" ]; then
             echo "Pinggy failed, trying bore-cli..."
             HOMEBREW_NO_AUTO_UPDATE=1 brew install bore-cli || true
-            nohup bore local 6080 --to bore.pub </dev/null >/tmp/vnc/bore.log 2>&1 &
+            nohup bore local 6080 --to bore.pub </dev/null >/tmp/macdesk/bore.log 2>&1 &
             for i in $(seq 1 20); do
-              BORE_HOST=$(grep -Eo 'bore\.pub:[0-9]+' /tmp/vnc/bore.log | head -1 || true)
+              BORE_HOST=$(grep -Eo 'bore\.pub:[0-9]+' /tmp/macdesk/bore.log | head -1 || true)
               if [ -n "$BORE_HOST" ]; then
                 TUNNEL_URL="http://${BORE_HOST}"
-                echo "Got Bore tunnel: $TUNNEL_URL"
                 break
               fi
               sleep 1
@@ -167,31 +583,29 @@ jobs:
           fi
 
           if [ -z "$TUNNEL_URL" ]; then
-            echo "ERROR: All tunnels failed."
-            cat /tmp/vnc/pinggy.log || true
-            cat /tmp/vnc/bore.log || true
+            echo "ERROR: Tunnel failed."
+            cat /tmp/macdesk/pinggy.log || true
             exit 1
           fi
 
-          FULL_URL="${TUNNEL_URL}/vnc.html?resize=scale&autoconnect=1"
-          echo "MACOS_VNC_URL=${FULL_URL}"
-          echo "$FULL_URL" > /tmp/vnc/vnc-url.txt
+          echo "MAC_CONSOLE_URL=${TUNNEL_URL}/"
+          echo "${TUNNEL_URL}/" > /tmp/macdesk/mac-url.txt
 
-      - name: Upload VNC URL & Desktop Screenshot
+      - name: Upload Mac Console URL & Screenshot
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: macos-vnc-url
           path: |
-            /tmp/vnc/vnc-url.txt
-            /tmp/shot.png
+            /tmp/macdesk/mac-url.txt
+            /tmp/macdesk/frame.jpg
           retention-days: 1
 
-      - name: Keep VNC Session Alive
+      - name: Keep Mac Desktop Session Alive
         env:
           MINS: ${{ inputs.duration_minutes }}
         run: |
-          nc -z 127.0.0.1 6080 || { echo "websockify not running"; exit 1; }
+          nc -z 127.0.0.1 6080 || { echo "Server died!"; cat /tmp/macdesk/server.log || true; exit 1; }
           MAX_MINS="${MINS:-55}"
           if [ "$MAX_MINS" -gt 60 ] 2>/dev/null; then MAX_MINS=60; fi
           SECONDS_LEFT=$((MAX_MINS * 60))
